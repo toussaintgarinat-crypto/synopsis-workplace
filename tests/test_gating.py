@@ -157,6 +157,9 @@ def test_modeles_fetches_live_list(monkeypatch):
     monkeypatch.setattr(httpx, "get", get)
     r = client().get("/modeles?provider=openrouter")
     assert r.json() == {"models": ["a/a", "z/b"], "source": "api"}
+    # La liste OpenRouter est publique et partagée en cache : on le vide pour observer l'appel avec clé.
+    from lib import models_catalog
+    models_catalog.vider_cache()
     r = client().post("/modeles", json={"provider": "openrouter", "api_key": "sk-secret"})
     assert r.json()["source"] == "api" and seen["h"] == {"Authorization": "Bearer sk-secret"}
 
@@ -204,7 +207,7 @@ def test_resumer_fichier_small_ok(monkeypatch):
     monkeypatch.setenv("SYNOPSIS_MODE", "full")
     monkeypatch.setenv("MAX_UPLOAD_MB", "1")
     import lib.whisper_transcriber as w
-    monkeypatch.setattr(w, "transcribe_file", lambda p, l: [{"text": "x", "start": 0, "duration": 1}])
+    monkeypatch.setattr(w, "transcribe_file_with_model", lambda p, l, model_size="": ([{"text": "x", "start": 0, "duration": 1}], "base"))
     monkeypatch.setattr(main, "_summarize_data", lambda *a, **k: {"titre": "a.mp3"})
     r = client().post("/resumer-fichier", files={"fichier": ("a.mp3", b"x" * 100)}, data={"api_key": "k"})
     assert r.status_code == 200

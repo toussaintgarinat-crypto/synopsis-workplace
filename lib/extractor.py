@@ -11,7 +11,36 @@ from youtube_transcript_api._errors import (
 )
 import httpx
 
+try:  # absents des anciennes versions de youtube-transcript-api
+    from youtube_transcript_api._errors import RequestBlocked  # IpBlocked en hérite
+except ImportError:  # pragma: no cover
+    RequestBlocked = None
+try:
+    from youtube_transcript_api._errors import IpBlocked
+except ImportError:  # pragma: no cover
+    IpBlocked = None
+
+from lib.capabilities import is_light_mode
+
 logger = logging.getLogger(__name__)
+
+
+class SansSousTitres(ValueError):
+    """La vidéo est lisible mais YouTube ne fournit pas de sous-titres (désactivés, absents,
+    vides, ou requête bloquée) : seul cas où une transcription par modèle vidéo a du sens."""
+
+
+_BLOQUE = tuple(c for c in (RequestBlocked, IpBlocked) if c is not None)
+
+
+def _classer(e: Exception) -> ValueError:
+    if isinstance(e, TranscriptsDisabled):
+        return SansSousTitres("Transcript désactivé sur cette vidéo YouTube")
+    if isinstance(e, NoTranscriptFound):
+        return SansSousTitres("Aucun transcript disponible pour cette vidéo")
+    if _BLOQUE and isinstance(e, _BLOQUE):
+        return SansSousTitres(f"Erreur transcript: {e}")
+    return ValueError(f"Erreur transcript: {e}")
 
 
 YOUTUBE_HOSTS = {
@@ -49,9 +78,12 @@ def detect_channel(url: str) -> bool:
     return bool(re.search(r'youtube\.com/(@|channel/|c/)', url))
 
 
-def get_video_title(video_id: str) -> str:
+def get_video_title(video_id: str, timeout: float = None) -> str:
+    """Titre via oEmbed. Délai court en mode léger (budget de 60 s par requête)."""
+    if timeout is None:
+        timeout = 3 if is_light_mode() else 10
     try:
-        r = httpx.get(f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json", timeout=10)
+        r = httpx.get(f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json", timeout=timeout)
         if r.status_code == 200:
             return r.json().get("title", f"Video {video_id}")
     except Exception:
@@ -74,35 +106,35 @@ def get_youtube_transcript(url: str, languages: list = None) -> dict:
     transcript_data = None
     original_lang = None
 
-    for lang in languages:
-        try:
-            transcript = yt_api.fetch(video_id, languages=[lang])
-            transcript_data = list(transcript)
-            original_lang = lang
-            break
-        except Exception:
-            continue
+    # Un seul appel : la bibliothèque choisit la première langue disponible dans l'ordre de
+    # priorité (comme l'ancienne boucle langue par langue, en 1 aller-retour au lieu de 6).
+    try:
+        transcript = yt_api.fetch(video_id, languages=list(languages))
+        transcript_data = list(transcript)
+        original_lang = getattr(transcript, 'language_code', None) or languages[0]
+    except CouldNotRetrieveTranscript:
+        pass  # classé par l'appel suivant (sans préférence de langue)
+    except Exception:
+        logger.debug("Sous-titres : premier essai échoué pour %s", video_id)
 
     if not transcript_data:
         try:
             transcript = yt_api.fetch(video_id)
             transcript_data = list(transcript)
             original_lang = getattr(transcript, 'language_code', 'en') or 'en'
-        except TranscriptsDisabled:
-            raise ValueError("Transcript désactivé sur cette vidéo YouTube")
-        except NoTranscriptFound:
-            raise ValueError("Aucun transcript disponible pour cette vidéo")
         except CouldNotRetrieveTranscript as e:
-            if "403" in str(e):
-                time.sleep(3)
+            if "403" not in str(e) or isinstance(e, (TranscriptsDisabled, NoTranscriptFound)):
+                raise _classer(e) from e
+            time.sleep(3)
+            try:
                 transcript = yt_api.fetch(video_id, languages=languages)
                 transcript_data = list(transcript)
                 original_lang = 'en'
-            else:
-                raise ValueError(f"Erreur transcript: {e}")
+            except CouldNotRetrieveTranscript as e2:
+                raise _classer(e2) from e2
 
     if not transcript_data:
-        raise ValueError("Transcript vide")
+        raise SansSousTitres("Transcript vide")
 
     formatted = [{'text': e.text, 'start': e.start, 'duration': e.duration} for e in transcript_data]
     last = formatted[-1]

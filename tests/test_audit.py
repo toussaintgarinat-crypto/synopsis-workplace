@@ -257,7 +257,7 @@ def test_upload_governed_by_upload_cap(monkeypatch):
     monkeypatch.setenv("MAX_UPLOAD_MB", "3")
     monkeypatch.setattr(main, "get_capabilities", _all_caps)
     import lib.whisper_transcriber as wt
-    monkeypatch.setattr(wt, "transcribe_file", lambda *a, **k: [{"text": "x", "start": 0.0, "duration": 1.0}])
+    monkeypatch.setattr(wt, "transcribe_file_with_model", lambda *a, **k: ([{"text": "x", "start": 0.0, "duration": 1.0}], "base"))
     monkeypatch.setattr(main, "_summarize_data", lambda *a, **k: R)
     ok = client().post("/resumer-fichier", files={"fichier": ("a.mp3", b"x" * (2 * 1024 * 1024))}, data={"api_key": "k"})
     assert ok.status_code == 200

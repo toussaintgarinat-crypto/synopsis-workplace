@@ -4,6 +4,7 @@ import functools
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 import httpx
@@ -14,7 +15,7 @@ from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import BaseModel, Field
 
-from lib.extractor import get_youtube_transcript
+from lib.extractor import get_youtube_transcript, SansSousTitres
 from lib.chunker import chunk_transcript, estimate_tokens
 from lib.fusion import (
     _extract_chapters, _extract_insights,
@@ -22,7 +23,7 @@ from lib.fusion import (
     _build_chapter_table, _build_insights_list,
 )
 from lib.qa import answer_question
-from lib.llm_client import llm_complete, list_local_models, list_custom_models
+from lib.llm_client import llm_complete, list_local_models, list_custom_models, LLMTimeoutError, MSG_DELAI
 from lib.exporters.markdown import to_markdown
 from lib.exporters.obsidian import save_note
 from lib.exporters.excalidraw import to_excalidraw
@@ -34,6 +35,9 @@ from lib import image_generator
 from lib import security
 from lib.security import installer_masquage_journaux
 from lib.extractor import extract_youtube_id
+from lib.video_transcriber import transcribe_youtube_via_llm, MSG_TIMEOUT_LIGHT
+from lib import models_catalog
+from lib.models_catalog import resolve_models, TACHES, TACHES_TEXTE
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("synopsis")
@@ -70,10 +74,14 @@ app.add_middleware(CORSMiddleware, allow_origins=_allowed_origins(), allow_metho
 
 @app.middleware("http")
 async def limite_debit(request: Request, call_next):
-    """Limite par IP des routes qui appellent un LLM (mode léger, ou RATE_LIMIT_PER_MIN défini)."""
-    if request.method == "POST" and request.url.path in security.LLM_PATHS:
+    """Limite par IP des routes qui appellent un LLM ou relaient une clé (mode léger, ou RATE_LIMIT_PER_MIN défini)."""
+    chemin = request.url.path
+    if request.method == "POST" and chemin in security.RATE_LIMITED_PATHS:
         limite = security.limite_par_minute(is_light_mode())
-        if limite and not security.RATE_LIMITER.autoriser(security.ip_client(request), limite):
+        cle = security.ip_client(request)
+        if chemin in security.MODELES_PATHS:
+            limite, cle = security.limite_modeles(limite), cle + "|modeles"
+        if limite and not security.RATE_LIMITER.autoriser(cle, limite):
             return JSONResponse({"detail": "Trop de requêtes : réessayez dans une minute."}, status_code=429,
                                 headers={"Retry-After": "60"})
     return await call_next(request)
@@ -155,12 +163,20 @@ CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP_TOKENS", "1200"))
 MODEL = os.getenv("LLM_MODEL", "deepseek/deepseek-v4-flash")
 
 
+MODELES_DESC = ("Per-task models {resume, fusion, qa, transcription_video, transcription_audio, image}; "
+                "empty or missing = default, unknown keys ignored")
+TRANSCRIPTION_LLM_DESC = ("If the video has no subtitles, transcribe it with a Gemini video model "
+                          "through OpenRouter (provider openrouter only, uses OpenRouter credits)")
+
+
 class ResumerRequest(BaseModel):
     url: str = Field(..., description="YouTube video URL")
     langue: str = Field("Français", description="Summary output language")
     modele: str = Field("", description="LLM model override")
     api_key: str = Field("", description="API key")
     provider: str = Field("", description="Provider: openrouter, openai, opencode, local, custom")
+    modeles: dict | None = Field(None, description=MODELES_DESC)
+    transcription_llm: bool = Field(True, description=TRANSCRIPTION_LLM_DESC)
 
 
 class LotRequest(BaseModel):
@@ -169,6 +185,8 @@ class LotRequest(BaseModel):
     modele: str = Field("", description="LLM model override")
     api_key: str = Field("", description="API key")
     provider: str = Field("", description="Provider: openrouter, openai, opencode, local")
+    modeles: dict | None = Field(None, description=MODELES_DESC)
+    transcription_llm: bool = Field(True, description=TRANSCRIPTION_LLM_DESC)
 
 
 class QaRequest(BaseModel):
@@ -178,6 +196,7 @@ class QaRequest(BaseModel):
     modele: str = Field("", description="LLM model override")
     api_key: str = Field("", description="API key")
     provider: str = Field("", description="Provider: openrouter, openai, opencode, local")
+    modeles: dict | None = Field(None, description=MODELES_DESC)
 
 
 class ReelRequest(BaseModel):
@@ -222,31 +241,127 @@ def _max_batch() -> int:
     return int(os.getenv("MAX_BATCH_FULL", "20"))
 
 
-def _transcript_hint() -> str:
+OPTION_VIDEO = "« Transcrire avec un modèle vidéo »"
+
+
+def _transcript_hint(provider: str = "", transcription_llm: bool = False) -> str:
+    """Conseil quand la vidéo n'a pas de sous-titres (court : le message est tronqué à 300 caractères)."""
+    openrouter = provider in ("", "openrouter")
     if is_light_mode():
-        return ("Cette version en ligne lit uniquement les sous-titres YouTube (pas de transcription audio) : "
-                "essayez une vidéo qui en a, ou utilisez la version locale (Whisper).")
-    return "Astuce : envoyez le fichier audio/vidéo pour une transcription Whisper."
+        base = "Pas de sous-titres YouTube et la version en ligne ne fait pas de transcription audio (Whisper)."
+        if not openrouter:
+            return base + f" Option {OPTION_VIDEO} : choisissez le fournisseur OpenRouter (Gemini), ou la version locale."
+        if not transcription_llm:
+            return base + f" Cochez l'option {OPTION_VIDEO} (Gemini via OpenRouter) ou utilisez la version locale."
+        return base + f" Saisissez une clé OpenRouter pour l'option {OPTION_VIDEO}, ou utilisez la version locale."
+    base = "Astuce : envoyez le fichier audio/vidéo pour une transcription Whisper"
+    if openrouter and transcription_llm:
+        return base + " (ou saisissez une clé OpenRouter pour la transcription par modèle vidéo)."
+    return base + f", ou activez {OPTION_VIDEO} avec OpenRouter."
 
 
-def _summarize(url: str, output_language: str = "Français", model: str = "", api_key: str = "", provider: str = "") -> dict:
+def _cle_openrouter(provider: str, api_key: str, explicite: bool = True) -> str:
+    """Clé OpenRouter utilisable pour le repli vidéo : fournisseur openrouter (ou vide) ;
+    clé du client, sinon celle du serveur seulement si le client a explicitement demandé
+    `transcription_llm`, qu'aucune passerelle (GATEWAY_URL) ne gère la facturation, et hors
+    mode léger (sauf ALLOW_SERVER_KEY=1)."""
+    if provider not in ("", "openrouter"):
+        return ""
+    cle = (api_key or "").strip()
+    if cle:
+        return cle
+    if not explicite or os.getenv("GATEWAY_URL", "").strip():
+        return ""
+    if is_light_mode() and os.getenv("ALLOW_SERVER_KEY") != "1":
+        return ""
+    return os.getenv("OPENROUTER_API_KEY", "").strip()
+
+
+# ---- Budget de temps du mode léger (fonction Vercel : 60 s par requête) ----
+LLM_VIDEO_TIMEOUT_MAX_LIGHT = 50.0
+MIN_TRANSCRIPTION_S = 10.0
+
+
+def _maintenant() -> float:
+    return time.monotonic()
+
+
+def _env_float(nom: str, defaut: float) -> float:
+    try:
+        return float(os.getenv(nom, str(defaut)))
+    except ValueError:
+        return defaut
+
+
+def _echeance_light():
+    """Échéance (horloge monotone) de la requête en mode léger ; None en mode complet."""
+    if not is_light_mode():
+        return None
+    return _maintenant() + _env_float("LIGHT_BUDGET_S", 55.0)
+
+
+def _budget_llm(deadline) -> dict:
+    """Arguments à passer à llm_complete : le temps restant avant l'échéance (rien en mode complet)."""
+    if deadline is None:
+        return {}
+    reste = deadline - _maintenant()
+    if reste < 1:
+        raise LLMTimeoutError(MSG_DELAI)
+    return {"timeout": reste}
+
+
+def _resoudre_modeles(req_modeles, modele: str = "") -> dict:
+    try:
+        return resolve_models(req_modeles, modele or MODEL)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+def _summarize(url: str, output_language: str = "Français", model: str = "", api_key: str = "", provider: str = "",
+               modeles: dict = None, transcription_llm: bool = False, transcription_llm_explicite: bool = True,
+               deadline: float = None) -> dict:
+    """`transcription_llm_explicite` : le client a-t-il envoyé le champ ? Sans lui, la clé du
+    serveur n'est jamais dépensée pour le repli (la clé du client reste utilisable).
+    `deadline` : échéance partagée (mode léger) ; créée ici si absente."""
     logger.info("Resumer %s (lang=%s)", url, output_language)
+    modeles = modeles or resolve_models(None, model or MODEL)
+    if deadline is None:
+        deadline = _echeance_light()
+    if deadline is not None and deadline - _maintenant() < 1:
+        raise LLMTimeoutError(MSG_DELAI)
     try:
         data = get_youtube_transcript(url)
     except ValueError as e:
-        if "ranscript" in str(e):
+        if "ranscript" not in str(e):
+            raise
+        # Repli payant uniquement si la vidéo est lisible mais sans sous-titres (pas supprimée, privée…).
+        cle = (_cle_openrouter(provider, api_key, transcription_llm_explicite)
+               if transcription_llm and isinstance(e, SansSousTitres) else "")
+        if not cle:
             cause = " ".join(str(e).split())[:140].rstrip(" .:")
-            raise ValueError(f"{_transcript_hint()} (Détail : {cause})") from e
-        raise
-    return _summarize_data(data, output_language, model, api_key, provider)
+            raise ValueError(f"{_transcript_hint(provider, transcription_llm)} (Détail : {cause})") from e
+        delai = None
+        if deadline is not None:
+            # Garder de quoi résumer : refuser AVANT l'appel payant si le reste est trop court.
+            reste = deadline - _maintenant() - _env_float("LIGHT_RESERVE_RESUME_S", 20.0)
+            if reste < MIN_TRANSCRIPTION_S:
+                raise ValueError(MSG_TIMEOUT_LIGHT) from e
+            delai = min(LLM_VIDEO_TIMEOUT_MAX_LIGHT, reste)
+        logger.info("Pas de sous-titres : transcription par %s", modeles["transcription_video"])
+        data = transcribe_youtube_via_llm(url, cle, modeles["transcription_video"], timeout=delai, provider="openrouter")
+    return _summarize_data(data, output_language, model, api_key, provider, modeles=modeles, deadline=deadline)
 
 
-def _summarize_data(data: dict, output_language: str = "Français", model: str = "", api_key: str = "", provider: str = "") -> dict:
+def _summarize_data(data: dict, output_language: str = "Français", model: str = "", api_key: str = "", provider: str = "",
+                    modeles: dict = None, deadline: float = None) -> dict:
+    if deadline is None:
+        deadline = _echeance_light()
     max_min = int(os.getenv("MAX_MINUTES_LIGHT", "30"))
     if is_light_mode() and data.get("total_duration_minutes", 0) > max_min:
         raise ValueError(f"Vidéo trop longue pour la version en ligne (max {max_min} min). Utilisez la version locale.")
 
-    model = model or MODEL
+    modeles = modeles or resolve_models(None, model or MODEL)
+    model = modeles["resume"]
     transcript = data["transcript"]
     title = data["title"]
     chunks = chunk_transcript(transcript, max_tokens=CHUNK_SIZE, overlap_tokens=CHUNK_OVERLAP)
@@ -257,8 +372,10 @@ def _summarize_data(data: dict, output_language: str = "Français", model: str =
         prompt = prompt_tpl.replace("{video_title}", title).replace("{output_language}", output_language).replace("{transcript}", ch["text"])
         logger.info("Analyse chunk %d/%d (%d tokens)", i + 1, len(chunks), ch["tokens"])
         try:
-            result = llm_complete(prompt, model=model, api_key=api_key, provider=provider)
+            result = llm_complete(prompt, model=model, api_key=api_key, provider=provider, **_budget_llm(deadline))
             analyses.append(result)
+        except LLMTimeoutError:
+            raise
         except Exception as e:
             logger.error("Chunk %d failed: %s", i + 1, e)
             analyses.append(f"[Chunk {i+1} error: {e}]")
@@ -267,25 +384,42 @@ def _summarize_data(data: dict, output_language: str = "Français", model: str =
         fusion_tpl = _load_prompt("fusion.xml")
         fusion_prompt = fusion_tpl.replace("{video_title}", title).replace("{output_language}", output_language).replace("{analyses}", "\n\n---\n\n".join(analyses))
         logger.info("Fusion des %d analyses", len(analyses))
-        final = llm_complete(fusion_prompt, model=model, api_key=api_key, provider=provider)
+        final = llm_complete(fusion_prompt, model=modeles["fusion"], api_key=api_key, provider=provider,
+                             **_budget_llm(deadline))
     else:
         final = analyses[0] if analyses else "Aucune analyse produite."
 
     chapters = _extract_chapters(final)
     insights = _extract_insights(final)
 
+    source = data.get("source") or "sous-titres"
+    utilises = {"resume": model}
+    if len(analyses) > 1:
+        utilises["fusion"] = modeles["fusion"]
+
     avertissements = []
+    if source == "llm-video":
+        modele_tr = data.get("model") or modeles["transcription_video"]
+        utilises["transcription_video"] = modele_tr
+        avertissements.append(f"Transcription générée par {modele_tr} (pas de sous-titres) : horodatages approximatifs.")
+    elif source == "whisper":
+        utilises["transcription_audio"] = data.get("model") or modeles["transcription_audio"]
     if not chapters:
         avertissements.append("Aucun chapitre exploitable n'a été trouvé dans la réponse du modèle.")
 
-    return {
+    out = {
         "titre": title,
         "resume": final,
         "chapitres": chapters,
         "insights": insights,
         "langue_source": data.get("language", "unknown"),
         "avertissements": avertissements,
+        "transcription": source,
+        "modeles_utilises": utilises,
     }
+    if source == "llm-video":
+        out["modele_transcription"] = utilises["transcription_video"]
+    return out
 
 
 def _highlight_reel(url: str, resume: str, duree_clip: float, sous_titres: bool, narration: bool, langue_narration: str, export_vertical: str) -> dict:
@@ -452,6 +586,12 @@ input:focus, select:focus { border-color: var(--accent); }
 footer { text-align: center; margin-top: 80px; color: var(--text2); font-size: 0.8rem; opacity: 0.5; }
 
 .indispo { opacity: .45; cursor: not-allowed; }
+#modeles-taches { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 14px; }
+#modeles-taches summary { cursor: pointer; font-family: var(--font-mono); font-size: 0.85rem; color: var(--text2); }
+.mt-ligne { margin-top: 14px; }
+.mt-aide { color: var(--text2); font-size: 0.75rem; margin-top: 6px; font-family: var(--font-mono); line-height: 1.5; }
+.mt-texte { text-transform: none; letter-spacing: 0; font-size: 0.85rem; }
+.result .meta.mt-utilises { margin: -14px 0 14px; font-size: 0.75rem; }
 </style>
 </head>
 <body>
@@ -494,6 +634,50 @@ footer { text-align: center; margin-top: 80px; color: var(--text2); font-size: 0
       </div>
     </div>
     <p id="modeles-source" style="color:var(--text2);font-size:0.75rem;margin-top:8px;font-family:var(--font-mono)"></p>
+    <details id="modeles-taches">
+      <summary data-t="mt_titre">Modèles par tâche</summary>
+      <p class="mt-aide" data-t="mt_intro">Choisissez un modèle adapté à chaque tâche. « Par défaut » reprend le modèle principal ci-dessus.</p>
+      <div class="mt-ligne">
+        <label for="mt-resume" data-t="mt_resume">Résumé (analyse des segments)</label>
+        <select id="mt-resume" class="mt-select" data-tache="resume"></select>
+        <p class="mt-aide" data-t="mt_resume_aide">Analyse chaque morceau de la transcription. Un modèle texte rapide et bon marché convient.</p>
+        <p class="mt-aide" id="mt-raison-resume"></p>
+      </div>
+      <div class="mt-ligne">
+        <label for="mt-fusion" data-t="mt_fusion">Fusion des analyses</label>
+        <select id="mt-fusion" class="mt-select" data-tache="fusion"></select>
+        <p class="mt-aide" data-t="mt_fusion_aide">Fusionne les analyses des longues vidéos en un seul résumé. Un modèle texte plus solide aide.</p>
+        <p class="mt-aide" id="mt-raison-fusion"></p>
+      </div>
+      <div class="mt-ligne">
+        <label for="mt-qa" data-t="mt_qa">Questions-réponses</label>
+        <select id="mt-qa" class="mt-select" data-tache="qa"></select>
+        <p class="mt-aide" data-t="mt_qa_aide">Répond à vos questions à partir du résumé. Un modèle texte conversationnel convient.</p>
+        <p class="mt-aide" id="mt-raison-qa"></p>
+      </div>
+      <div class="mt-ligne">
+        <label for="mt-transcription_video" data-t="mt_transcription_video">Transcription vidéo (sans sous-titres)</label>
+        <select id="mt-transcription_video" class="mt-select" data-tache="transcription_video" data-cap="transcription_video"></select>
+        <p class="mt-aide" data-t="mt_transcription_video_aide">Lit la vidéo YouTube quand il n'y a pas de sous-titres : modèles Gemini uniquement (OpenRouter).</p>
+        <p class="mt-aide" id="mt-raison-transcription_video"></p>
+      </div>
+      <div class="mt-ligne">
+        <label for="mt-transcription_audio" data-t="mt_transcription_audio">Transcription audio (Whisper)</label>
+        <select id="mt-transcription_audio" class="mt-select" data-tache="transcription_audio" data-cap="whisper"></select>
+        <p class="mt-aide" data-t="mt_transcription_audio_aide">Taille du modèle Whisper pour un fichier envoyé (version locale) : plus gros = plus précis mais plus lent.</p>
+        <p class="mt-aide" id="mt-raison-transcription_audio"></p>
+      </div>
+      <div class="mt-ligne">
+        <label for="mt-image" data-t="mt_image">Génération d'image</label>
+        <select id="mt-image" class="mt-select" data-tache="image" data-cap="images"></select>
+        <p class="mt-aide" data-t="mt_image_aide">Crée une illustration du résumé (version locale) : modèles qui produisent des images.</p>
+        <p class="mt-aide" id="mt-raison-image"></p>
+      </div>
+      <div class="btn-row" style="margin-top:14px">
+        <button type="button" class="btn btn-secondary" id="btn-mt-refresh" onclick="rafraichirModelesTaches()" data-t="mt_actualiser">↻ Actualiser</button>
+      </div>
+      <p class="mt-aide" id="mt-statut"></p>
+    </details>
   </div>
 
   <div class="card">
@@ -512,6 +696,11 @@ footer { text-align: center; margin-top: 80px; color: var(--text2); font-size: 0
         </select>
       </div>
     </div>
+    <div class="check-row">
+      <input type="checkbox" id="transcription-llm" checked data-cap="transcription_video">
+      <label for="transcription-llm" class="mt-texte" data-t="transcription_llm">Si la vidéo n'a pas de sous-titres, la transcrire avec un modèle vidéo (consomme des crédits OpenRouter, ≈ 0,007 $ par minute)</label>
+    </div>
+    <div id="transcription-llm-light" class="mt-aide" data-t="transcription_llm_light" style="display:none">Version en ligne : limite d'environ 60 s côté serveur, donc vidéos courtes uniquement.</div>
     <div class="btn-row">
       <button class="btn" id="btn-resumer" onclick="resumer()">
         <span data-t="resumer">Résumer</span> <span class="spinner"></span>
@@ -584,11 +773,37 @@ var FR_SECOURS = {
   question: 'Poser une question', demander: 'Demander', ph_question: 'Une question sur cette vidéo...',
   langue_source: 'Langue source',
   avertissements: 'Avertissements', prov_custom: 'Personnalisé',
-  limites_light: 'Version en ligne : fonctionne uniquement avec les vidéos qui ont des sous-titres YouTube (manuels ou automatiques) et jusqu’à environ 30 minutes. Pour une vidéo sans sous-titres, utilisez la version locale (transcription Whisper).',
+  limites_light: 'Version en ligne : vidéos jusqu’à environ 30 minutes, avec sous-titres YouTube (manuels ou automatiques). Sans sous-titres : option « transcrire avec un modèle vidéo » (OpenRouter + Gemini, vidéos courtes) ou version locale (Whisper).',
   err_url: 'Colle une URL YouTube.', err_cle: 'Saisis ta clé API dans Configuration.', err_urls: 'Colle au moins une URL.',
   fichier_titre: 'Résumer un fichier audio/vidéo', resumer_fichier: 'Transcrire et résumer', err_fichier: 'Choisis un fichier audio ou vidéo.',
   export_obsidian: 'Envoyer vers Obsidian', export_excalidraw: 'Enregistrer en Excalidraw', ph_vault: 'Dossier du vault Obsidian', ok_obsidian: 'Note enregistrée : ', err_vault: 'Indique le dossier du vault.',
-  export_drive: 'Envoyer vers Google Drive', ok_drive: 'Envoyé vers Drive : ', generer_image: 'Générer une image', err_image: 'Génération d’image impossible.'
+  export_drive: 'Envoyer vers Google Drive', ok_drive: 'Envoyé vers Drive : ', generer_image: 'Générer une image', err_image: 'Génération d’image impossible.',
+  mt_titre: 'Modèles par tâche',
+  mt_intro: 'Choisissez un modèle adapté à chaque tâche. « Par défaut » reprend le modèle principal ci-dessus.',
+  mt_defaut: 'Par défaut',
+  mt_identique: 'Identique au résumé',
+  mt_actualiser: '↻ Actualiser',
+  mt_erreur: 'Actualisation impossible (réseau).',
+  mt_listes_chargees: 'listes chargées',
+  mt_echec: 'échec',
+  mt_resume: 'Résumé (analyse des segments)',
+  mt_resume_aide: 'Analyse chaque morceau de la transcription. Un modèle texte rapide et bon marché convient.',
+  mt_fusion: 'Fusion des analyses',
+  mt_fusion_aide: 'Fusionne les analyses des longues vidéos en un seul résumé. Un modèle texte plus solide aide.',
+  mt_qa: 'Questions-réponses',
+  mt_qa_aide: 'Répond à vos questions à partir du résumé. Un modèle texte conversationnel convient.',
+  mt_transcription_video: 'Transcription vidéo (sans sous-titres)',
+  mt_transcription_video_aide: 'Lit la vidéo YouTube quand il n’y a pas de sous-titres : modèles Gemini uniquement (OpenRouter).',
+  mt_transcription_audio: 'Transcription audio (Whisper)',
+  mt_transcription_audio_aide: 'Taille du modèle Whisper pour un fichier envoyé (version locale) : plus gros = plus précis mais plus lent.',
+  mt_image: 'Génération d’image',
+  mt_image_aide: 'Crée une illustration du résumé (version locale) : modèles qui produisent des images.',
+  transcription_llm: 'Si la vidéo n’a pas de sous-titres, la transcrire avec un modèle vidéo (consomme des crédits OpenRouter, ≈ 0,007 $ par minute)',
+  transcription_llm_light: 'Version en ligne : limite d’environ 60 s côté serveur, donc vidéos courtes uniquement.',
+  modeles_utilises: 'Modèles utilisés',
+  mt_l_resume: 'résumé',
+  mt_l_fusion: 'fusion',
+  transcription_source: 'Transcription générée par'
 };
 var DICT = {};
 var LANGUE = 'fr';
@@ -754,6 +969,151 @@ $('#provider-select').addEventListener('change', onProviderChange);
 $('#api-key').addEventListener('change', saveConfig);
 $('#modele-select').addEventListener('change', saveConfig);
 
+// ---- Modèles par tâche ----
+var TACHES = ['resume', 'fusion', 'qa', 'transcription_video', 'transcription_audio', 'image'];
+var MODELE_RE = new RegExp('^[A-Za-z0-9._:/-]{1,100}$');
+var TACHES_SECOURS = {
+  transcription_video: ['google/gemini-2.5-flash', 'google/gemini-2.5-flash-lite', 'google/gemini-2.5-pro'],
+  transcription_audio: ['tiny', 'base', 'small', 'medium', 'large'],
+  image: ['black-forest-labs/flux.2-klein-4b', 'black-forest-labs/flux.2-pro', 'recraft/recraft-v4.1', 'google/gemini-2.5-flash-image', 'openai/gpt-5-image-mini']
+};
+var mtCharge = {};
+function cleModelesTaches(p) { return 'synopsis_modeles_' + p; }
+function lireModelesTaches(p) {
+  var out = {};
+  try {
+    var brut = JSON.parse(localStorage.getItem(cleModelesTaches(p)) || '{}');
+    if (brut && typeof brut === 'object') {
+      for (var i = 0; i < TACHES.length; i++) {
+        var v = brut[TACHES[i]];
+        if (typeof v === 'string' && MODELE_RE.test(v)) out[TACHES[i]] = v;
+      }
+    }
+  } catch (e) {}
+  return out;
+}
+function getModelesTaches(tous) {
+  var o = {};
+  for (var i = 0; i < TACHES.length; i++) {
+    var sel = $('#mt-' + TACHES[i]);
+    if (!sel || (!tous && sel.disabled)) continue;
+    if (sel.value && MODELE_RE.test(sel.value)) o[TACHES[i]] = sel.value;
+  }
+  return o;
+}
+function getTranscriptionLlm() {
+  var c = $('#transcription-llm');
+  return !!(c && c.checked && !c.disabled);
+}
+function enregistrerModelesTaches() {
+  // Uniquement des identifiants de modèles (jamais de clé), par fournisseur.
+  try { localStorage.setItem(cleModelesTaches(getProvider()), JSON.stringify(getModelesTaches(true))); } catch (e) {}
+}
+function listeSecoursTache(tache, p) {
+  if (tache === 'resume' || tache === 'fusion' || tache === 'qa') return FALLBACK_MODELS[p] || [];
+  if (tache === 'transcription_audio') return TACHES_SECOURS.transcription_audio;
+  return p === 'openrouter' ? TACHES_SECOURS[tache] : [];
+}
+function remplirTache(tache, models, noms, raison, voulu) {
+  var sel = $('#mt-' + tache);
+  if (!sel) return;
+  voulu = (typeof voulu === 'string' && MODELE_RE.test(voulu)) ? voulu : '';
+  sel.textContent = '';
+  var o0 = document.createElement('option');
+  var cle0 = (tache === 'fusion' || tache === 'qa') ? 'mt_identique' : 'mt_defaut';
+  o0.value = '';
+  o0.setAttribute('data-t', cle0);
+  o0.textContent = t(cle0);
+  sel.appendChild(o0);
+  var liste = Array.isArray(models) ? models.slice() : [];
+  if (voulu && liste.indexOf(voulu) === -1) liste.unshift(voulu);
+  for (var i = 0; i < liste.length; i++) {
+    var id = String(liste[i]);
+    if (!MODELE_RE.test(id)) continue;
+    var o = document.createElement('option');
+    o.value = id;
+    o.textContent = (noms && typeof noms[id] === 'string') ? id + ' · ' + noms[id] : id;
+    sel.appendChild(o);
+  }
+  sel.value = voulu;
+  var r = $('#mt-raison-' + tache);
+  if (r) r.textContent = raison ? String(raison) : '';
+}
+function initModelesTaches() {
+  var p = getProvider();
+  var choix = lireModelesTaches(p);
+  for (var i = 0; i < TACHES.length; i++) {
+    remplirTache(TACHES[i], listeSecoursTache(TACHES[i], p), null, '', choix[TACHES[i]] || '');
+  }
+  $('#mt-statut').textContent = '';
+}
+async function chargerTache(tache, p, k, choix) {
+  var r = await fetch('/modeles', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({provider: p, api_key: k, tache: tache})
+  });
+  if (!r.ok) {
+    var detail = '';
+    try {
+      var j = await r.json();
+      if (j && typeof j.detail === 'string') detail = j.detail;
+    } catch (e) {}
+    throw new Error(detail || ('HTTP ' + r.status));
+  }
+  var d = await r.json();
+  remplirTache(tache, d.models || [], d.noms || null, d.raison || '', choix[tache] || '');
+  return (d.models || []).length;
+}
+async function rafraichirModelesTaches() {
+  var p = getProvider();
+  var k = getApiKey();
+  var btn = $('#btn-mt-refresh');
+  var statut = $('#mt-statut');
+  var choix = getModelesTaches(true);
+  btn.disabled = true;
+  // allSettled : une liste en échec ne masque pas les autres (elle garde sa liste de secours).
+  var res = await Promise.allSettled(TACHES.map(function(tc) { return chargerTache(tc, p, k, choix); }));
+  var nb = 0;
+  var echecs = [];
+  for (var i = 0; i < res.length; i++) {
+    if (res[i].status === 'fulfilled') { nb++; continue; }
+    echecs.push(TACHES[i] + ' : ' + messageErreurListe(res[i].reason));
+  }
+  if (nb === TACHES.length) mtCharge[p] = true;
+  var txt = nb + '/' + TACHES.length + ' ' + t('mt_listes_chargees');
+  if (echecs.length) txt += ' · ' + t('mt_echec') + ' ' + echecs.join(' · ');
+  // textContent : le message du serveur est affiché comme texte, jamais interprété en HTML.
+  statut.textContent = txt;
+  btn.disabled = false;
+}
+function messageErreurListe(e) {
+  if (!e || e instanceof TypeError || !e.message) return t('mt_erreur');
+  return String(e.message).slice(0, 160);
+}
+function ligneModeles(data) {
+  var mu = (data && data.modeles_utilises && typeof data.modeles_utilises === 'object') ? data.modeles_utilises : {};
+  var parts = [];
+  if (mu.resume) parts.push('<span data-t="mt_l_resume">' + escapeHtml(t('mt_l_resume')) + '</span> ' + escapeHtml(mu.resume));
+  if (mu.fusion) parts.push('<span data-t="mt_l_fusion">' + escapeHtml(t('mt_l_fusion')) + '</span> ' + escapeHtml(mu.fusion));
+  var html = '';
+  if (parts.length) html += '<div class="meta mt-utilises"><span data-t="modeles_utilises">' + escapeHtml(t('modeles_utilises')) + '</span> : ' + parts.join(', ') + '</div>';
+  if (data && data.transcription === 'llm-video') {
+    html += '<div class="meta mt-utilises"><span data-t="transcription_source">' + escapeHtml(t('transcription_source')) + '</span> ' + escapeHtml(data.modele_transcription || mu.transcription_video || '') + '</div>';
+  }
+  return html;
+}
+(function initTaches() {
+  for (var i = 0; i < TACHES.length; i++) {
+    var sel = $('#mt-' + TACHES[i]);
+    if (sel) sel.addEventListener('change', enregistrerModelesTaches);
+  }
+  $('#provider-select').addEventListener('change', initModelesTaches);
+  $('#modeles-taches').addEventListener('toggle', function() {
+    if ($('#modeles-taches').open && !mtCharge[getProvider()]) rafraichirModelesTaches();
+  });
+})();
+// ---- fin Modèles par tâche ----
+
 var CAPS = {};
 function capOk(nom) { return !!(CAPS[nom] && CAPS[nom].ok); }
 async function chargerCapacites() {
@@ -763,6 +1123,8 @@ async function chargerCapacites() {
     CAPS = d.capacites || {};
     var lim = $('#limites');
     if (lim && d.mode === 'light') lim.style.display = '';
+    var noteTr = $('#transcription-llm-light');
+    if (noteTr && d.mode === 'light') noteTr.style.display = '';
   } catch (e) { CAPS = {}; }
   appliquerCapacites();
 }
@@ -787,6 +1149,7 @@ chargerCapacites();
 
 (function init() {
   loadConfig();
+  initModelesTaches();
 })();
 
 var errTimer = null;
@@ -821,7 +1184,7 @@ async function resumer() {
   try {
     const r = await fetch('/resumer', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({url, langue: $('#langue').value, api_key: apiKey, modele: getModele(), provider: provider})
+      body: JSON.stringify({url, langue: $('#langue').value, api_key: apiKey, modele: getModele(), provider: provider, modeles: getModelesTaches(), transcription_llm: getTranscriptionLlm()})
     });
     if (!r.ok) { const d = await r.json(); throw new Error(d.detail || r.statusText); }
     const data = await r.json();
@@ -837,6 +1200,7 @@ async function resumer() {
 function afficherResume(data, cible) {
   var html = '';
   html += '<h3 class="titre-video">' + escapeHtml(data.titre) + '</h3>';
+  html += ligneModeles(data);
   html += '<div class="meta"><span data-t="langue_source">' + t('langue_source') + '</span> : ' + escapeHtml(data.langue_source) + '</div>';
   html += '<div class="section"><h4 data-t="resume">' + t('resume') + '</h4><div class="resume-text">' + escapeHtml(data.resume) + '</div></div>';
   if (data.avertissements && data.avertissements.length) {
@@ -881,7 +1245,7 @@ async function poserQuestion() {
   try {
     var r = await fetch('/qa', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({titre: dernierResume.titre, resume: dernierResume.resume, question: q, api_key: apiKey, modele: getModele(), provider: provider})
+      body: JSON.stringify({titre: dernierResume.titre, resume: dernierResume.resume, question: q, api_key: apiKey, modele: getModele(), provider: provider, modeles: getModelesTaches()})
     });
     var d = await r.json();
     if (!r.ok) throw new Error(d.detail || r.statusText);
@@ -910,7 +1274,7 @@ async function resumerLot() {
       try {
         var r = await fetch('/resumer', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({url: urls[i], langue: $('#langue').value, api_key: apiKey, modele: getModele(), provider: provider})
+          body: JSON.stringify({url: urls[i], langue: $('#langue').value, api_key: apiKey, modele: getModele(), provider: provider, modeles: getModelesTaches(), transcription_llm: getTranscriptionLlm()})
         });
         var d = await r.json();
         if (!r.ok) throw new Error(d.detail || r.statusText);
@@ -942,6 +1306,7 @@ async function resumerFichier() {
     fd.append('modele', getModele());
     fd.append('api_key', apiKey);
     fd.append('provider', provider);
+    fd.append('modeles', JSON.stringify(getModelesTaches()));
     var r = await fetch('/resumer-fichier', {method: 'POST', body: fd});
     var d = await r.json();
     if (!r.ok) throw new Error(d.detail || r.statusText);
@@ -1105,7 +1470,7 @@ function genererImage() {
   hideError();
   var btn = $('#btn-image');
   setLoading(btn, true);
-  fetch('/image', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({resultat: dernierResume, api_key: getApiKey(), provider: getProvider()})})
+  fetch('/image', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({resultat: dernierResume, api_key: getApiKey(), provider: getProvider(), modeles: getModelesTaches()})})
     .then(function(r) { return r.json().then(function(j) { if (!r.ok) throw new Error(j.detail || t('err_image')); return j; }); })
     .then(function(j) {
       var img = document.createElement('img');
@@ -1169,66 +1534,51 @@ def sante():
     return checks
 
 
-PROVIDER_MODELS_API = {
-    "openrouter": "https://openrouter.ai/api/v1/models",
-    "openai": "https://api.openai.com/v1/models",
-    "opencode": None,
-}
-
-PROVIDER_FALLBACK_MODELS = {
-    "openrouter": [
-        "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
-        "google/gemini-2.5-pro", "google/gemini-2.5-flash",
-        "anthropic/claude-sonnet-4.5", "anthropic/claude-opus-4.5",
-        "openai/gpt-5.2", "openai/gpt-5.2-mini",
-        "qwen/qwen3-coder", "mistral/pi-zero-2",
-        "x-ai/grok-4", "amazon/nova-pro-v2",
-    ],
-    "openai": ["gpt-5.2", "gpt-5.2-mini", "gpt-4.1", "gpt-4.1-mini", "o4-mini", "o3"],
-    "opencode": ["deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro"],
-}
+PROVIDER_MODELS_API = models_catalog.PROVIDER_MODELS_API
+PROVIDER_FALLBACK_MODELS = models_catalog.PROVIDER_FALLBACK_MODELS
 
 
-def _liste_modeles(provider: str, api_key: str = "") -> dict:
+def _liste_modeles(provider: str, api_key: str = "", tache: str = "") -> dict:
+    """Modèles proposés pour une tâche. Sans `tache` : comportement historique (résumé, sans champs en plus)."""
+    t = tache or "resume"
+    if t not in TACHES:
+        raise HTTPException(status_code=400, detail="Tâche inconnue : choisissez parmi " + ", ".join(TACHES) + ".")
     caps = get_capabilities()
     if provider == "local":
         _exiger("llm_local", caps)
-        return {"models": list_local_models(), "source": "local"}
-    if provider == "custom":
+    elif provider == "custom":
         _exiger("llm_custom", caps)
-        return {"models": list_custom_models(api_key), "source": "custom"}
-    url = PROVIDER_MODELS_API.get(provider)
-    if not url:
-        return {"models": PROVIDER_FALLBACK_MODELS.get(provider, []), "source": "fallback"}
-    try:
-        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        r = httpx.get(url, headers=headers, timeout=15)
-        if r.status_code == 200:
-            data = r.json()["data"]
-            models = sorted([m["id"] for m in data if m.get("id")])
-            return {"models": models, "source": "api"}
-    except Exception:
-        pass
-    return {"models": PROVIDER_FALLBACK_MODELS.get(provider, []), "source": "fallback"}
+    if provider == "local" and t in TACHES_TEXTE:
+        res = {"models": list_local_models(), "source": "local"}
+    elif provider == "custom" and t in TACHES_TEXTE:
+        res = {"models": list_custom_models(api_key), "source": "custom"}
+    else:
+        res = models_catalog.fetch_models(provider, t, api_key)
+    if not tache:
+        return {"models": res["models"], "source": res["source"]}
+    res["tache"] = t
+    return res
 
 
 @app.get("/modeles")
-def modeles(provider: str = "openrouter"):
+def modeles(provider: str = "openrouter", tache: str = ""):
     # Pas de clé en query string (journaux, historique) : utiliser POST pour une liste authentifiée.
-    return _liste_modeles(provider)
+    return _liste_modeles(provider, "", tache)
 
 
 class ModelesRequest(BaseModel):
     provider: str = Field("openrouter", description="Provider")
     api_key: str = Field("", description="API key")
+    tache: str = Field("", description="Task: " + ", ".join(TACHES) + " (default resume)")
 
 
 @app.post("/modeles")
 def modeles_post(req: ModelesRequest):
-    return _liste_modeles(req.provider, req.api_key)
+    return _liste_modeles(req.provider, req.api_key, req.tache)
 
 
 MAX_ITEMS_EXPORT = 2000
+MAX_MODELES_JSON = 2000
 
 
 def _valider_resultat(d) -> dict:
@@ -1286,6 +1636,7 @@ class ImageRequest(BaseModel):
     api_key: str = Field("", description="API key")
     provider: str = Field("", description="Provider of the key; only openrouter (or empty) is used for images")
     modele: str = Field("", description="Image model override")
+    modeles: dict | None = Field(None, description=MODELES_DESC)
 
 
 @app.post("/export/drive")
@@ -1307,12 +1658,18 @@ def export_drive(body: dict):
 def generate_image_route(req: ImageRequest):
     _exiger("images")
     _valider_resultat(req.resultat)
+    demandes = dict(req.modeles) if isinstance(req.modeles, dict) else req.modeles
+    if isinstance(demandes, dict) and not str(demandes.get("image") or "").strip() and req.modele.strip():
+        demandes["image"] = req.modele
+    elif demandes is None and req.modele.strip():
+        demandes = {"image": req.modele}
+    modele_image = _resoudre_modeles(demandes)["image"]
     key = req.api_key if req.provider in ("", "openrouter") else ""
     key = key or os.getenv("OPENROUTER_API_KEY", "")
     if not key:
         raise HTTPException(status_code=400, detail="Clé API OpenRouter requise pour générer une image.")
     try:
-        data = image_generator.generate_image(image_generator.build_image_prompt(req.resultat), key, req.modele)
+        data = image_generator.generate_image(image_generator.build_image_prompt(req.resultat), key, modele_image)
     except Exception as e:
         raise HTTPException(status_code=502, detail="Génération d'image impossible : " + str(e))
     import base64
@@ -1322,9 +1679,14 @@ def generate_image_route(req: ImageRequest):
 @app.post("/resumer")
 def resumer(req: ResumerRequest):
     _verifier_llm(req.provider, req.api_key)
+    modeles_req = _resoudre_modeles(req.modeles, req.modele)
     try:
-        result = _summarize(req.url, req.langue, req.modele, api_key=req.api_key, provider=req.provider)
+        result = _summarize(req.url, req.langue, req.modele, api_key=req.api_key, provider=req.provider,
+                            modeles=modeles_req, transcription_llm=req.transcription_llm,
+                            transcription_llm_explicite="transcription_llm" in req.model_fields_set)
         return result
+    except LLMTimeoutError as e:
+        raise HTTPException(status_code=504, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -1334,11 +1696,21 @@ def resumer(req: ResumerRequest):
 
 @app.post("/resumer-fichier")
 def resumer_fichier(fichier: UploadFile = File(...), langue: str = Form("Français"), modele: str = Form(""),
-                    api_key: str = Form(""), provider: str = Form("")):
+                    api_key: str = Form(""), provider: str = Form(""), modeles: str = Form("")):
     caps = _exiger("whisper")
     _verifier_llm(provider, api_key, caps)
+    demandes = None
+    if modeles.strip():
+        if len(modeles) > MAX_MODELES_JSON:
+            raise HTTPException(status_code=400, detail=f"Champ « modeles » trop long (max {MAX_MODELES_JSON} caractères).")
+        try:
+            demandes = json.loads(modeles)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Champ « modeles » invalide : JSON attendu.")
+    modeles_req = _resoudre_modeles(demandes, modele)
+    taille_whisper = str((demandes or {}).get("transcription_audio") or "").strip()
     import tempfile
-    from lib.whisper_transcriber import transcribe_file
+    from lib import whisper_transcriber
     suffix = Path(fichier.filename or "").suffix[:10]
     if not suffix.replace(".", "").isalnum():
         suffix = ""
@@ -1356,13 +1728,18 @@ def resumer_fichier(fichier: UploadFile = File(...), langue: str = Form("França
                 if total > limite:
                     raise HTTPException(status_code=413, detail="Fichier trop volumineux (max " + os.getenv("MAX_UPLOAD_MB", "200") + " Mo).")
                 out.write(bloc)
-        segments = transcribe_file(tmp, "")
+        # model_size vide = valeur serveur (WHISPER_MODEL).
+        segments, modele_audio = whisper_transcriber.transcribe_file_with_model(tmp, "", model_size=taille_whisper)
         if not segments:
             raise ValueError("Aucune parole détectée dans le fichier.")
-        data = {"transcript": segments, "title": nom, "language": "unknown"}
-        return _summarize_data(data, langue, modele, api_key=api_key, provider=provider)
+        # Modèle réellement utilisé (taille locale, ou whisper-1 si le repli API OpenAI a servi).
+        data = {"transcript": segments, "title": nom, "language": "unknown", "source": "whisper",
+                "model": modele_audio or modeles_req["transcription_audio"]}
+        return _summarize_data(data, langue, modele, api_key=api_key, provider=provider, modeles=modeles_req)
     except HTTPException:
         raise
+    except LLMTimeoutError as e:
+        raise HTTPException(status_code=504, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -1378,12 +1755,17 @@ def resumer_fichier(fichier: UploadFile = File(...), langue: str = Form("França
 @app.post("/qa")
 def qa(req: QaRequest):
     _verifier_llm(req.provider, req.api_key)
+    modele_qa = _resoudre_modeles(req.modeles, req.modele)["qa"]
+    deadline = _echeance_light()
     try:
         rep = answer_question(
             req.titre, req.resume, req.question,
-            lambda p: llm_complete(p, model=req.modele or MODEL, api_key=req.api_key, provider=req.provider),
+            lambda p: llm_complete(p, model=modele_qa, api_key=req.api_key, provider=req.provider,
+                                   **_budget_llm(deadline)),
         )
         return {"reponse": rep}
+    except LLMTimeoutError as e:
+        raise HTTPException(status_code=504, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -1397,9 +1779,17 @@ def resumer_lot(req: LotRequest):
     n = len([u for u in req.urls if u.strip()])
     if n > _max_batch():
         raise HTTPException(status_code=400, detail=f"Trop de vidéos dans le lot ({n}) : maximum {_max_batch()}.")
+    modeles_req = _resoudre_modeles(req.modeles, req.modele)
+    explicite = "transcription_llm" in req.model_fields_set
+    # Mode léger : une seule échéance pour tout le lot (la fonction entière a 60 s). Les vidéos
+    # traitées après l'échéance échouent proprement (« Délai dépassé… ») sans appel payant, et le
+    # repli Gemini n'est tenté que s'il reste assez de temps (même règle que /resumer).
+    deadline = _echeance_light()
     return summarize_many(
         req.urls,
-        lambda u: _summarize(u, req.langue, req.modele, api_key=req.api_key, provider=req.provider),
+        lambda u: _summarize(u, req.langue, req.modele, api_key=req.api_key, provider=req.provider,
+                             modeles=modeles_req, transcription_llm=req.transcription_llm,
+                             transcription_llm_explicite=explicite, deadline=deadline),
     )
 
 

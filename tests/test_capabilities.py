@@ -32,3 +32,10 @@ def test_llm_custom_needs_env_in_full(monkeypatch):
     assert c.get_capabilities()["llm_custom"]["ok"] is False
     monkeypatch.setenv("CUSTOM_LLM_URL", "http://x/v1")
     assert c.get_capabilities()["llm_custom"]["ok"] is True
+
+
+def test_transcription_video_ok_in_both_modes(monkeypatch):
+    monkeypatch.setenv("SYNOPSIS_MODE", "light")
+    assert c.get_capabilities()["transcription_video"] == {"ok": True, "raison": ""}
+    monkeypatch.setenv("SYNOPSIS_MODE", "full")
+    assert c.get_capabilities()["transcription_video"]["ok"] is True

@@ -18,7 +18,8 @@ def _has(module: str) -> bool:
 
 
 def get_capabilities() -> dict:
-    caps = {"resume": {"ok": True, "raison": ""}}
+    # transcription_video : appel OpenRouter avec la clé du client, possible dans les deux modes.
+    caps = {"resume": {"ok": True, "raison": ""}, "transcription_video": {"ok": True, "raison": ""}}
     if is_light_mode():
         for k in HEAVY:
             caps[k] = {"ok": False, "raison": LIGHT_REASON}

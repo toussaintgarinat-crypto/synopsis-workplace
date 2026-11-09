@@ -203,6 +203,15 @@ class RateLimiter:
 
 RATE_LIMITER = RateLimiter()
 LLM_PATHS = ("/resumer", "/resumer-lot", "/resumer-fichier", "/qa", "/reel", "/image")
+# /modeles (POST) relaie une clé vers l'API du fournisseur : limité aussi, dans un compteur à part
+# (le front charge 6 listes d'un coup, cela ne doit pas consommer le quota des routes LLM).
+MODELES_PATHS = ("/modeles",)
+RATE_LIMITED_PATHS = LLM_PATHS + MODELES_PATHS
+
+
+def limite_modeles(limite_llm: int) -> int:
+    """Quota par minute de POST /modeles : 3 fois celui des routes LLM (0 = pas de limite)."""
+    return limite_llm * 3
 
 
 def limite_par_minute(light: bool) -> int:

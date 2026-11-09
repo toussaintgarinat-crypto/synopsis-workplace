@@ -17,6 +17,13 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = os.getenv("LLM_MODEL", "deepseek/deepseek-v4-flash")
 MAX_RETRIES = 2
+DEFAULT_TIMEOUT = 180
+MSG_DELAI = ("Délai dépassé : le modèle n'a pas répondu à temps (la version en ligne doit répondre en moins de 60 s). "
+             "Essayez une vidéo plus courte ou la version locale.")
+
+
+class LLMTimeoutError(RuntimeError):
+    """Le budget de temps passé à llm_complete(timeout=...) est épuisé (HTTP 504 côté routes)."""
 
 
 OPENROUTER_MODELS = [
@@ -94,8 +101,13 @@ def list_custom_models(api_key: str = "") -> list[str]:
     return []
 
 
-def llm_complete(prompt: str, model: str = "", system: str = "", temperature: float = 0.3, api_key: str = "", provider: str = "") -> str:
+def llm_complete(prompt: str, model: str = "", system: str = "", temperature: float = 0.3, api_key: str = "", provider: str = "",
+                 timeout: float = None) -> str:
+    """`timeout` : None = comportement historique (180 s par tentative, nouvelles tentatives).
+    Un nombre = budget total en secondes pour l'appel, tentatives comprises (plafonné à 180 s
+    par tentative) ; une fois épuisé, LLMTimeoutError (message « Délai dépassé… »)."""
     model = model or DEFAULT_MODEL
+    t = {"timeout": timeout}
     gateway_url = os.getenv("GATEWAY_URL", "").rstrip("/")
     gateway_key = os.getenv("GATEWAY_KEY", os.getenv("LITELLM_MASTER_KEY", ""))
 
@@ -103,13 +115,13 @@ def llm_complete(prompt: str, model: str = "", system: str = "", temperature: fl
         return _complete_openai_compatible(
             f"{gateway_url}/v1/chat/completions",
             prompt, model, system, temperature,
-            api_key=gateway_key,
+            api_key=gateway_key, **t,
         )
 
     if provider == "local":
         return _complete_openai_compatible(
             f"{LOCAL_LLM_URL}/v1/chat/completions",
-            prompt, model, system, temperature, api_key="ollama",
+            prompt, model, system, temperature, api_key="ollama", **t,
         )
 
     if provider == "custom":
@@ -117,7 +129,7 @@ def llm_complete(prompt: str, model: str = "", system: str = "", temperature: fl
         if not base:
             raise RuntimeError("Fournisseur personnalisé non configuré (CUSTOM_LLM_URL).")
         return _complete_openai_compatible(
-            f"{base}/chat/completions", prompt, model, system, temperature, api_key=api_key,
+            f"{base}/chat/completions", prompt, model, system, temperature, api_key=api_key, **t,
         )
 
     if provider and api_key:
@@ -125,7 +137,7 @@ def llm_complete(prompt: str, model: str = "", system: str = "", temperature: fl
         return _complete_openai_compatible(
             base_url, prompt, model, system, temperature,
             api_key=api_key,
-            extra_headers=PROVIDER_EXTRA_HEADERS.get(provider, {}),
+            extra_headers=PROVIDER_EXTRA_HEADERS.get(provider, {}), **t,
         )
 
     openrouter_key = api_key or os.getenv("OPENROUTER_API_KEY", "")
@@ -134,7 +146,7 @@ def llm_complete(prompt: str, model: str = "", system: str = "", temperature: fl
             "https://openrouter.ai/api/v1/chat/completions",
             prompt, model, system, temperature,
             api_key=openrouter_key,
-            extra_headers={"HTTP-Referer": "https://synopsis.local", "X-Title": "Synopsis"},
+            extra_headers={"HTTP-Referer": "https://synopsis.local", "X-Title": "Synopsis"}, **t,
         )
 
     opencode_key = os.getenv("OPENCODE_GO_API_KEY", "")
@@ -142,7 +154,7 @@ def llm_complete(prompt: str, model: str = "", system: str = "", temperature: fl
         return _complete_openai_compatible(
             "https://opencode.ai/zen/go/v1/chat/completions",
             prompt, model, system, temperature,
-            api_key=opencode_key,
+            api_key=opencode_key, **t,
         )
 
     openai_key = os.getenv("OPENAI_API_KEY", "")
@@ -150,7 +162,7 @@ def llm_complete(prompt: str, model: str = "", system: str = "", temperature: fl
         return _complete_openai_compatible(
             "https://api.openai.com/v1/chat/completions",
             prompt, model, system, temperature,
-            api_key=openai_key,
+            api_key=openai_key, **t,
         )
 
     raise RuntimeError(
@@ -168,6 +180,7 @@ def _complete_openai_compatible(
     temperature: float = 0.3,
     api_key: str = "",
     extra_headers: dict = None,
+    timeout: float = None,
 ) -> str:
     messages = []
     if system:
@@ -187,21 +200,42 @@ def _complete_openai_compatible(
         "max_tokens": 32000,
     }
 
+    fin = time.monotonic() + float(timeout) if timeout is not None else None
+
+    def reste() -> float:
+        return fin - time.monotonic() if fin is not None else float(DEFAULT_TIMEOUT)
+
+    def pause(secondes: float) -> bool:
+        """Attend avant la tentative suivante ; False si le budget ne le permet pas."""
+        if fin is not None and secondes >= reste() - 1:
+            return False
+        time.sleep(secondes)
+        return True
+
     last_err = None
     for attempt in range(MAX_RETRIES + 1):
+        if reste() < 1:
+            raise LLMTimeoutError(MSG_DELAI)
         try:
-            r = httpx.post(base_url, json=payload, headers=headers, timeout=180)
+            r = httpx.post(base_url, json=payload, headers=headers, timeout=min(DEFAULT_TIMEOUT, reste()))
             if r.status_code == 200:
                 data = r.json()
                 return data["choices"][0]["message"]["content"]
             if r.status_code == 429:
-                time.sleep(5 * (attempt + 1))
                 last_err = f"Rate limited (attempt {attempt + 1})"
+                if not pause(5 * (attempt + 1)):
+                    break
                 continue
             last_err = f"HTTP {r.status_code}: {r.text[:300]}"
-        except httpx.RequestError as e:
+        except httpx.TimeoutException as e:
+            if fin is not None:
+                raise LLMTimeoutError(MSG_DELAI) from e
             last_err = str(e)
             if attempt < MAX_RETRIES:
                 time.sleep(2)
+        except httpx.RequestError as e:
+            last_err = str(e)
+            if attempt < MAX_RETRIES and not pause(2):
+                break
 
     raise RuntimeError(f"LLM call failed after {MAX_RETRIES + 1} attempts: {last_err}")
