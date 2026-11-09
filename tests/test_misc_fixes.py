@@ -112,4 +112,7 @@ def test_i18n_new_keys_both_languages():
 def test_vercel_includes_prompts():
     cfg = json.loads((Path(main.__file__).parent / "vercel.json").read_text())
     f = cfg["functions"]["api/index.py"]
-    assert f["includeFiles"] == "prompts/**" and f["maxDuration"] == 60 and cfg["rewrites"]
+    assert f["includeFiles"] == "prompts/**" and f["maxDuration"] == 60
+    # routes (et non rewrites) : avec rewrites, l'app recevait /api/index au lieu du chemin demandé
+    assert cfg["routes"] == [{"src": "/(.*)", "dest": "/api/index.py"}]
+    assert "rewrites" not in cfg
