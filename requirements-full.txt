@@ -1,0 +1,5 @@
+-r requirements.txt
+gtts
+yt-dlp>=2026.3.17
+fpdf2
+openai-whisper

@@ -1,354 +1,126 @@
-# YouTube Summarizer
+# Synopsis Workplace
 
-Résumez n'importe quelle vidéo YouTube, Twitch, Vimeo, TikTok ou fichier audio/vidéo local grâce à l'IA — en français, anglais, espagnol ou autre langue.
+**Résumé vidéo YouTube par IA** — conçu pour fonctionner en standalone **ou** comme brique du projet [Workplace](https://github.com/anomalyco/youtube-summarizer).
 
-Disponible en **trois modes** : application web (Streamlit), application desktop (Tkinter), ou conteneur Docker.
-
----
-
-## 🚀 Démarrage rapide (Docker — recommandé)
-
-**Une seule commande :**
+## Quick Start
 
 ```bash
-OPENROUTER_API_KEY=sk-or-v1-xxx \
-  bash -c "$(curl -sSL https://raw.githubusercontent.com/toussaintgarinat-crypto/youtube-summarizer/main/start.sh)"
+# Standalone
+export OPENROUTER_API_KEY="sk-or-..."
+pip install -r requirements.txt      # mode léger (jeu minimal, utilisé par Vercel)
+# pip install -r requirements-full.txt  # mode complet (inclut requirements.txt)
+python main.py
+
+# Test
+curl -X POST http://localhost:6090/resumer -H "Content-Type: application/json" -d '{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "langue": "Français"}'
 ```
 
-Remplacez `sk-or-v1-xxx` par votre clé OpenRouter (gratuite sur [openrouter.ai/keys](https://openrouter.ai/keys)).
+## Modes de fonctionnement
 
-L'app est alors accessible sur **[http://localhost:8501](http://localhost:8501)**.
+| Mode | Cible | Fonctions |
+|------|-------|-----------|
+| `full` (défaut) | local / Docker | Tout : Whisper, reel (ffmpeg), LLM local, Obsidian, Drive, images, TTS |
+| `light` | Vercel (serverless) | Résumé, Q&R, export Markdown ; fonctions lourdes désactivées (Whisper, reel, LLM local, Obsidian, Drive, Excalidraw, images, TTS) |
 
----
+### Variables d'environnement
 
-## Fonctionnalités
+| Variable | Rôle |
+|----------|------|
+| `SYNOPSIS_MODE` | `full` (défaut) ou `light`. Automatiquement `light` si `VERCEL` est défini |
+| `LOCAL_LLM_URL` | URL du LLM local (ex. Ollama : `http://localhost:11434`, depuis Docker : `http://host.docker.internal:11434`) |
+| `WHISPER_MODEL` | Modèle Whisper local (défaut `base`) |
+| `GOOGLE_DRIVE_CREDENTIALS` | Identifiants Google Drive pour `/export/drive` |
+| `OPENAI_API_KEY` | Transcription Whisper via API / fournisseur d'images |
+| `OPENROUTER_API_KEY` | Clé LLM OpenRouter |
+| `MAX_MINUTES_LIGHT` | Durée max (minutes) d'une vidéo en mode léger (défaut 30) |
+| `HOST` | Adresse d'écoute (défaut `127.0.0.1`) |
+| `ALLOWED_ORIGINS` / `ALLOWED_HOSTS` | Origines CORS et hôtes acceptés (voir Sécurité) |
+| `ALLOW_SERVER_KEY` | `1` : en mode léger, autorise les requêtes LLM sans clé client (utilise la clé du serveur). Par défaut refusé, pour ne pas offrir votre clé à tout le monde |
+| `MAX_BATCH_LIGHT` / `MAX_BATCH_FULL` | Nombre max d'URL par lot (défaut 3 / 20). L'interface résume les vidéos une par une (`/resumer`) |
+| `MAX_UPLOAD_MB` | Taille max d'un fichier pour `/resumer-fichier` (défaut 200, 413 au-delà) |
+| `MAX_BODY_MB` | Taille max du corps des requêtes JSON (défaut 5, 413 au-delà) ; `/resumer-fichier` est plafonné par `MAX_UPLOAD_MB` |
+| `RATE_LIMIT_PER_MIN` | Requêtes LLM max par minute et par IP (`/resumer*`, `/qa`, `/reel`, `/image`). Actif par défaut (20) en mode léger, ou dès que la variable est définie ; `0` désactive |
+| `OBSIDIAN_ALLOWED_ROOTS` | Racines autorisées pour le dossier du vault Obsidian (séparées par `:`), défaut : dossier personnel |
+| `CUSTOM_LLM_URL` | URL de base OpenAI-compatible du fournisseur « Personnalisé » (ex. `http://hote:8000/v1`) ; lue uniquement côté serveur. Option désactivée si absente |
 
-| Fonctionnalité | Description |
-|---|---|
-| **📺 Analyse vidéo** | Résumé de YouTube, Twitch, Vimeo, TikTok, Twitter/X, Instagram, 1 000+ plateformes |
-| **🎙️ Whisper** | Transcription automatique via Whisper API ou local si pas de sous-titres |
-| **📁 Fichiers locaux** | Analyse de mp3, mp4, wav, m4a, ogg, flac, webm, mkv, avi, mov |
-| **🎬 Playlists YouTube** | Analyse toutes les vidéos d'une playlist avec un rapport consolidé |
-| **💬 Chat / Q&A** | Posez des questions sur le contenu de la vidéo après l'analyse |
-| **🖼️ Génération d'images** | Créez une illustration du résumé — **10 providers** : Flux, Recraft, Gemini, OpenAI, Seedream, Riverflow, MAI Image, Grok Imagine, Stability AI (direct), Replicate (direct), Pruna AI (direct) |
-| **📐 Schéma Excalidraw** | Génération automatique d'un diagramme arborescent des concepts clés, éditable dans [Excalidraw](https://excalidraw.com) |
-| **✏️ Prompt custom + amélioration IA** | Écrivez votre propre prompt ou faites-le améliorer par l'IA (méthode CTLT+) |
-| **🔌 Providers centralisés** | Toutes les clés API (OpenRouter, Stability AI, Replicate, Pruna AI) configurables dans la sidebar |
-| **🌍 Multilingue** | Résumé en français, anglais, espagnol, allemand, portugais, italien |
-| **📄 Export** | Markdown, PDF |
-| **🔄 Fallback automatique** | Bascule sur un autre modèle LLM gratuit en cas de saturation |
-
----
-
-## Installation
-
-### Avec Docker (recommandé)
-
-**Prérequis :** [Docker Desktop](https://docs.docker.com/get-docker/) installé et lancé.
+### Lancement local (mode complet)
 
 ```bash
-# 1. Cloner le dépôt
-git clone https://github.com/toussaintgarinat-crypto/youtube-summarizer.git
-cd youtube-summarizer
-
-# 2. Configurer la clé API
-cp .env.example .env
-# Éditer .env et renseigner OPENROUTER_API_KEY=sk-or-v1-...
-
-# 3. Lancer l'application
-docker compose up -d
-
-# 4. Ouvrir le navigateur
-# → http://localhost:8501
+pip install -r requirements-full.txt
+set -a; . ./.env; set +a; python3 main.py
 ```
 
-**📱 Mode PWA (icône sur le téléphone) :**
+### Docker (mode complet, avec ffmpeg)
 
 ```bash
-docker compose up -d
-# Puis ouvrir : http://localhost:8500
-# iOS  → Safari > Partager > Sur l'écran d'accueil
-# Android → Chrome > Menu > Installer l'application
+docker compose up --build
 ```
 
-**Autres commandes utiles :**
+Le `.env` est lu au runtime (`env_file`) et exclu de l'image via `.dockerignore`. Le build installe `openai-whisper` (lourd : première construction longue).
 
-| Commande | Effet |
-|---|---|
-| `docker compose up -d` | Lancer en arrière-plan |
-| `docker compose logs -f` | Voir les logs en direct |
-| `docker compose down` | Arrêter le container |
-| `docker compose build --no-cache` | Rebuilder l'image de zéro |
+### Dépendances
 
-**Détail de ce que fait Docker :**
+| Fichier | Contenu | Usage |
+|---------|---------|-------|
+| `requirements.txt` | jeu léger | Vercel (lu automatiquement), mode `light` |
+| `requirements-full.txt` | `-r requirements.txt` + gtts, yt-dlp, fpdf2, openai-whisper | mode `full`, Docker |
+| `requirements-dev.txt` | `-r requirements-full.txt` + pytest | développement et tests |
 
-1. **Build** : construit une image Python 3.11 avec ffmpeg, Node.js et toutes les dépendances
-2. **Run** : démarre le container sur le port 8501
-3. **Volume** : monte `config.py` pour que les modifs soient prises en compte sans rebuild
-4. **.env** : injecté automatiquement → pas de clé API dans l'image
+Tests : `pip install -r requirements-dev.txt && python3 -m pytest tests -q`
 
-> Sans Docker Compose : `docker run -p 8501:8501 --env-file .env youtube-summarizer`
+### Vercel (mode léger)
 
-### Sans Docker (code source)
+Les fichiers `vercel.json`, `api/index.py` et `requirements.txt` (jeu léger, seul fichier lu par Vercel) sont fournis. Définir `SYNOPSIS_MODE=light` dans les variables d'environnement du projet Vercel (Settings > Environment Variables) ; le mode léger est aussi activé automatiquement quand `VERCEL` est présent. Durée max de fonction : 60 s. `vercel.json` inclut `prompts/**` dans la fonction (`includeFiles`) pour que les prompts XML soient déployés. En mode léger, l'utilisateur doit saisir sa propre clé API (sauf `ALLOW_SERVER_KEY=1`).
+
+## Mode Gateway (Workplace)
+
+Quand la variable `GATEWAY_URL` est définie, Synopsis détecte automatiquement le Gateway Workplace et route tous les appels LLM via celui-ci :
 
 ```bash
-# 1. Prérequis : Python 3.11, ffmpeg
-brew install ffmpeg    # macOS
-# apt install ffmpeg   # Linux
-
-# 2. Installer les dépendances
-pip install -r requirements.txt
-
-# 3. Configurer la clé API
-cp .env.example .env
-# Éditer .env et renseigner OPENROUTER_API_KEY
-
-# 4. Lancer
-streamlit run app.py   # Interface web
-# ou
-python gui.py          # Interface desktop
+export GATEWAY_URL="http://host.docker.internal:4001"
+export GATEWAY_KEY="sk-wp-..."
+python main.py
 ```
 
-### Avec PyInstaller (build standalone)
+## Endpoints API
 
-```bash
-pip install pyinstaller
-pyinstaller gui.spec   # Build l'application desktop
-# L'executable se trouve dans dist/
-```
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/sante` | Health check (+ statut Gateway) |
+| `POST` | `/resumer` | `{"url": "...", "langue": "Français"}` → résumé structuré |
+| `POST` | `/reel` | `{"url": "...", "duree_clip": 45}` → highlight reel |
+| `POST` | `/resumer-lot` | Résumé de plusieurs vidéos en lot |
+| `POST` | `/resumer-fichier` | Résumé d'un fichier envoyé (multipart) |
+| `POST` | `/qa` | Question/réponse sur un résumé / transcript |
+| `POST` | `/export/markdown` | Export Markdown |
+| `POST` | `/export/obsidian` | Export vers un coffre Obsidian (mode complet) |
+| `POST` | `/export/excalidraw` | Export Excalidraw |
+| `POST` | `/export/drive` | Export Google Drive (mode complet) |
+| `POST` | `/image` | Génération d'image (mode complet) |
+| `GET` | `/i18n/{lang}` | Textes de l'interface dans la langue demandée |
 
----
+## Sécurité
 
-## Utilisation
+- **Liaison réseau** : le serveur écoute sur `127.0.0.1` par défaut (variable `HOST`). L'image Docker fixe `HOST=0.0.0.0` dans le conteneur ; `docker-compose.yml` publie le port uniquement sur `127.0.0.1:6090`.
+- **CORS restreint** : `ALLOWED_ORIGINS` (liste séparée par des virgules, défaut `http://localhost:6090,http://127.0.0.1:6090`, plus le `PORT` courant).
+- **Contrôle d'origine** : toute requête POST/PUT/DELETE portant un en-tête `Origin` (ou `Referer`) d'une origine non autorisée reçoit un 403 (protège `/export/obsidian`, `/export/drive`, `/image`, `/qa`, `/resumer*`, `/reel` contre les pages web tierces). Sans `Origin`/`Referer` (curl, appels serveur à serveur comme la passerelle Workplace) la requête passe ; une origine identique à l'hôte demandé passe aussi.
+- **Hôtes de confiance** : `localhost`, `127.0.0.1`, `host.docker.internal`, plus `ALLOWED_HOSTS` (liste séparée par des virgules, ex. le nom de service Docker utilisé par Workplace) et `*.vercel.app` quand `VERCEL` est défini.
+- **Sec-Fetch-Site** : une requête POST marquée `cross-site` (ou `same-site` d'une origine non autorisée) par le navigateur est refusée (403), même sans `Origin`. L'origine identique à l'hôte n'est acceptée que sous la forme exacte `scheme://hôte[:port]`.
+- **En-têtes** : `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: same-origin` (et non `no-referrer`, qui ferait envoyer `Origin: null` aux POST de la page), CSP sur toutes les réponses. La page `/` a une CSP stricte : `default-src 'none'`, script inline et gestionnaires `onclick` autorisés uniquement par empreinte SHA-256 (`'unsafe-hashes'`, pas de `'unsafe-inline'` pour les scripts), `connect-src 'self'`, `frame-ancestors 'none'`. Les exports HTML/PDF portent leur propre CSP (`default-src 'none'`) : aucun script ne s'y exécute.
+- **Vault Obsidian** : chemin absolu (ou `~`), situé après résolution des liens symboliques dans le dossier personnel (ou `OBSIDIAN_ALLOWED_ROOTS`), sans dossier caché (`.ssh`, `.claude`, `.config`...) ni `~/Library` (sauf `Mobile Documents` / `CloudStorage`, pour les vaults iCloud). Une note existante n'est jamais écrasée sauf si elle a été créée par Synopsis (front-matter `tags: [synopsis, youtube]`).
+- **Limite de débit** : en mémoire, par IP. Sur Vercel (serverless), chaque instance a sa propre mémoire : la limite est indicative (best-effort) ; pour une vraie limite, utiliser un pare-feu/WAF ou un stockage partagé.
+- **Erreurs et journaux** : les messages d'erreur renvoyés au client sont tronqués et purgés de tout ce qui ressemble à un secret (`sk-...`, `Bearer ...`, jetons Google, valeurs des variables `*KEY*`/`*TOKEN*`/`*SECRET*`) ; même filtrage sur toutes les entrées de journal.
+- **Clé API dans le navigateur** : la clé saisie dans l'interface est conservée dans le `localStorage` du navigateur (`synopsis_api_key_<fournisseur>`), en clair, pour l'origine de l'application uniquement. Elle est envoyée au serveur Synopsis à chaque appel LLM, jamais dans une URL. Sur un poste partagé, videz-la (champ vide puis changement de champ) ou les données du site.
+- **Reel** : l'URL est réduite à son identifiant YouTube puis reconstruite (`https://www.youtube.com/watch?v=ID`) avant yt-dlp, appelé avec `--` (pas d'injection d'options ni de requête vers un hôte arbitraire).
+- Ne pas exposer publiquement une instance contenant des clés (`.env`) sans authentification (reverse proxy).
 
-### 1. Obtenir une clé API OpenRouter (gratuit)
+## Intégration Workplace
 
-1. Créez un compte sur [openrouter.ai](https://openrouter.ai)
-2. Allez dans **Keys** → **Create Key**
-3. Copiez la clé (commence par `sk-or-v1-...`)
+1. Copier ce dossier dans `~/Desktop/Workplace/briques/synopsis/`
+2. `cd ~/Desktop/Workplace/briques/synopsis && make up`
+3. `curl -X POST http://localhost:5000/briques/reload`
+4. L'assistant IA Workplace auto-découvre les capacités `youtube_resumer` et `youtube_reel`
 
-Les **modèles gratuits** (suffixe `:free`) ne nécessitent aucun crédit.
+## Licence
 
-### 2. Analyser une vidéo
-
-**URL vidéo** : collez un lien YouTube, Twitch, Vimeo, etc. → l'app récupère le transcript natif ou transcrit avec Whisper.
-
-**Playlist YouTube** : collez une URL de playlist (ex: `youtube.com/playlist?list=...`) → l'app détecte automatiquement et analyse toutes les vidéos.
-
-**Fichier local** : importez un fichier audio/vidéo → transcription Whisper + analyse.
-
-### 3. Après l'analyse
-
-- **💬 Poser une question** : interrogez le contenu de la vidéo (ex: "Quel est le sujet principal ?")
-- **🎨 Générer une image** : créez une illustration basée sur le résumé (choix du provider et du style)
-- **📄 Exporter** : sauvegardez en Markdown ou PDF
-
----
-
-## Comment ça marche — Guide complet
-
-### Pipeline d'analyse
-
-```
-                   ┌─────────────────────────┐
-                   │  URL / Playlist / Fichier │
-                   └────────┬────────────────┘
-                            ↓
-                    ┌───────┴───────┐
-                    │  Détection    │
-                    │  plateforme   │
-                    └───────┬───────┘
-                            ↓
-              ┌─────────────┴─────────────┐
-              │                           │
-         Transcript natif ?           Whisper
-      (YouTube, Twitch, Vimeo)    (yt-dlp + OpenAI API
-              │                   ou modèle local)
-              │                           │
-              └─────────────┬─────────────┘
-                            ↓
-                   ┌────────────────┐
-                   │  Découpage en  │
-                   │  chunks        │
-                   │  (tiktoken)    │
-                   └────────┬───────┘
-                            ↓
-              ┌─────────────┴─────────────┐
-              │                           │
-         ┌────┴────┐              ┌───────┴──────┐
-         │ Chunk 1 │   ...        │  Chunk N     │
-         │ Analyse │              │  Analyse     │
-         │   LLM   │              │    LLM       │
-         └────┬────┘              └───────┬──────┘
-              │                           │
-              └─────────────┬─────────────┘
-                            ↓
-                   ┌────────────────┐
-                   │    Fusion      │ (si N > 1)
-                   │   des analyses │
-                   └────────┬───────┘
-                            ↓
-                   ┌────────────────┐
-                   │  Résumé final  │
-                   └────────┬───────┘
-                            ↓
-               ┌─────────────┼──────────────┬──────────────┐
-               │             │              │              │
-          Export MD      Chat Q&A      Image gen      Excalidraw
-          Export PDF    (transcript    (résumé →      (concepts →
-                        → question)    prompt → IA)   arbre → .excalidraw)
-```
-
-### Détail de chaque étape
-
-#### 1. Extraction du transcript (`src/extractor.py`)
-
-| Plateforme | Méthode | Source |
-|---|---|---|
-| **YouTube** | `youtube-transcript-api` | Sous-titres natifs |
-| **Twitch** | API Helix + VTT | VODs avec sous-titres |
-| **Vimeo** | Scraping HTML + VTT | Vidéos avec sous-titres |
-| **Autres** | Whisper (via yt-dlp) | Audio téléchargé puis transcrit |
-
-Pour les **playlists YouTube**, `yt-dlp --flat-playlist` liste toutes les vidéos, puis chacune est analysée individuellement.
-
-#### 2. Transcription Whisper (`src/whisper_transcriber.py`)
-
-Si aucun transcript natif n'est disponible :
-1. **yt-dlp** télécharge l'audio (mp3, qualité 5)
-2. **ffmpeg** compresse en 16kHz mono 32kbps
-3. **Whisper** transcrit (priorité API OpenAI, fallback modèle local)
-4. Si le fichier > 24 MB, il est découpé en chunks de 20 min
-
-#### 3. Découpage en chunks (`src/chunker.py`)
-
-- **Tokenisation** via `tiktoken` (cl100k_base)
-- **Taille par défaut** : 12 000 tokens
-- **Chevauchement** : 10% entre les chunks (conserve le contexte)
-- Les chunks respectent les timestamps de la vidéo
-
-#### 4. Analyse LLM (`src/analyzer.py`)
-
-- Appelle l'API **OpenRouter** avec un prompt structuré (XML)
-- Si le modèle est saturé (HTTP 429), **bascule automatiquement** sur le prochain modèle gratuit disponible
-- Timeout : 180 secondes par requête
-- Le prompt demande : résumé exécutif, table des chapitres, points clés, insights
-
-#### 5. Fusion (`src/fusion.py`)
-
-Pour les vidéos longues (multi-chunks) :
-- Fusionne les tables de chapitres avec dédup
-- Sélectionne les meilleurs insights
-- Appelle le LLM une dernière fois pour un rapport cohérent
-
-#### 6. Post-traitement
-
-| Feature | Module | Description |
-|---|---|---|
-| **📄 PDF** | `src/pdf_exporter.py` | Conversion Markdown → PDF (fpdf2) |
-| **💬 Chat Q&A** | Intégré dans l'UI | LLM + transcript complet comme contexte |
-| **🖼️ Image** | `src/image_generator.py` | 10 providers : Flux, Recraft, Gemini, OpenAI, Seedream, Riverflow, MAI Image, Grok Imagine, Stability AI (direct), Replicate (direct), Pruna AI (direct). Prompt custom + amélioration CTLT+ |
-| **📐 Excalidraw** | `src/excalidraw_generator.py` | Extraction de concepts via LLM + fallback markdown, layout arbre, export .excalidraw |
-
----
-
-## Architecture du projet
-
-```
-youtube-summarizer/
-│
-├── app.py                    # Interface web (Streamlit) — principale
-├── gui.py                    # Interface desktop (Tkinter)
-├── cli.py                    # Interface en ligne de commande
-├── youtube_summarizer_app.py # Version simplifiée (Streamlit, build EXE)
-│
-├── Dockerfile                # Image Docker (Python 3.11 + ffmpeg + Node.js)
-├── docker-compose.yml        # Orchestration Docker (port, volume, env)
-├── start.sh                  # Script one-liner : setup + build + run
-│
-├── config.py                 # Configuration centralisée (env, secrets)
-├── requirements.txt          # Dépendances Python
-├── packages.txt              # Dépendances système (ffmpeg, nodejs)
-│
-├── src/
-│   ├── extractor.py           # Détection plateforme + extraction transcript
-│   ├── whisper_transcriber.py # Téléchargement audio + Whisper
-│   ├── chunker.py             # Découpage token-aware du transcript
-│   ├── analyzer.py            # Appel LLM OpenRouter avec fallback
-│   ├── fusion.py              # Fusion multi-chunks
-│   ├── models.py              # Liste dynamique des modèles OpenRouter
-│   ├── image_generator.py     # Génération d'images (10 providers + prompt custom + CTLT+)
-│   ├── excalidraw_generator.py# Schémas conceptuels Excalidraw (LLM + layout arbre)
-│   └── pdf_exporter.py        # Export Markdown → PDF
-│
-├── prompts/
-│   ├── analyzer.xml           # Prompt LLM pour un chunk
-│   └── fusion.xml             # Prompt LLM pour la fusion
-│
-├── test_core.py               # Tests unitaires (30+ classes)
-│
-├── *.spec                     # Build PyInstaller (Mac, Windows, Linux)
-├── build_app.sh               # Build script macOS
-├── run.sh / run.bat           # Lanceurs (Mac/Windows)
-│
-└── .streamlit/
-    ├── config.toml            # Thème Streamlit (dark, upload 500MB)
-    ├── secrets.toml           # Clés API (gitignoré)
-    └── secrets.toml.example   # Template pour secrets.toml
-```
-
----
-
-## Détail des interfaces
-
-### Interface web (Streamlit — `app.py`)
-
-| Élément | Description |
-|---|---|
-| **🔑 Sidebar** | Clé API, modèle LLM, chunk size, langue, cookies Whisper, **providers images** (Stability AI, Replicate, Pruna AI) |
-| **🔗 Tab URL** | URL vidéo, playlist, ou plateforme tierce |
-| **📁 Tab Fichier** | Upload audio/vidéo local |
-| **📜 Historique** | 10 dernières analyses sauvegardées en session |
-| **🖼️ Génération d'image** | Provider, style, **mode Auto/Custom + amélioration CTLT+** |
-| **📐 Schéma Excalidraw** | Génération d'un diagramme arborescent des concepts + téléchargement .excalidraw |
-
-### Interface desktop (Tkinter — `gui.py`)
-
-Mêmes fonctionnalités que la version web, mais en application native :
-- Fenêtre redimensionnable (920x780)
-- Barre de progression
-- Export Markdown / PDF / Copier
-- Gestion des clés API en direct
-
-### CLI (`cli.py`)
-
-```bash
-python cli.py "URL_VIDEO" --model "modele" --chunk-size 12000 -o resultat.md
-```
-
----
-
-## Variables d'environnement (`.env`)
-
-| Variable | Obligatoire | Défaut | Description |
-|---|---|---|---|
-| `OPENROUTER_API_KEY` | ✅ | — | Clé API OpenRouter |
-| `OPENAI_API_KEY` | ❌ | — | Clé API OpenAI (Whisper API) |
-| `APP_PASSWORD` | ❌ | — | Mot de passe pour l'app web |
-| `DEFAULT_MODEL` | ❌ | `meta-llama/llama-3.3-70b-instruct:free` | Modèle LLM par défaut |
-| `CHUNK_SIZE_TOKENS` | ❌ | `12000` | Taille des chunks en tokens |
-| `CHUNK_OVERLAP_TOKENS` | ❌ | `1200` | Chevauchement entre chunks |
-| `WHISPER_MODEL` | ❌ | `base` | Modèle Whisper local |
-| `YOUTUBE_COOKIES` | ❌ | — | Cookies YouTube (pour vidéos restreintes) |
-
----
-
-## CI/CD — Build automatique
-
-| Workflow | Runner | Artifact |
-|---|---|---|
-| `build-mac.yml` | `macos-latest` | `YouTubeSummarizer-Mac.dmg` |
-| `build-windows.yml` | `windows-latest` | `YouTubeSummarizer-Windows.zip` |
-| `build-linux.yml` | `ubuntu-latest` | `YouTubeSummarizer-Linux.tar.gz` |
-
-Les builds sont déclenchés automatiquement à chaque push sur `main`, ou manuellement via **Actions → Run workflow**.
+MIT

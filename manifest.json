@@ -1,0 +1,73 @@
+{
+  "nom": "synopsis",
+  "version": "1.0.0",
+  "description": "Résumé de vidéos YouTube par IA — extraction transcript, synthèse LLM, chapitrage automatique, highlight reels.",
+  "role": "youtube",
+  "couche": "backend",
+  "statut": "actif",
+  "chemin_source": "~/Desktop/synopsis-workplace",
+  "port": 6090,
+  "url_sante": "http://host.docker.internal:6090/sante",
+  "depends_on": ["gateway"],
+  "offre": [
+    "resume_video_youtube",
+    "highlight_reel",
+    "transcription_youtube"
+  ],
+  "besoin": [
+    "llm_chat"
+  ],
+  "capacites": [
+    {
+      "nom": "youtube_resumer",
+      "description": "Résume une vidéo YouTube à partir de son URL. Extrait la transcription, l'analyse via LLM, et produit un résumé structuré avec chapitres temporels et insights clés.",
+      "methode": "POST",
+      "chemin": "/resumer",
+      "params": {
+        "url": {
+          "type": "string",
+          "description": "URL de la vidéo YouTube à résumer",
+          "requis": true
+        },
+        "langue": {
+          "type": "string",
+          "description": "Langue du résumé (Français, English, Español, Deutsch, Português, Italiano)",
+          "enum": ["Français", "English", "Español", "Deutsch", "Português", "Italiano"]
+        }
+      },
+      "action": false
+    },
+    {
+      "nom": "youtube_reel",
+      "description": "Crée un highlight reel vidéo à partir des moments clés identifiés dans un résumé YouTube. Télécharge la vidéo, extrait les clips par chapitre, les assemble avec sous-titres et narration TTS optionnelle.",
+      "methode": "POST",
+      "chemin": "/reel",
+      "params": {
+        "url": {
+          "type": "string",
+          "description": "URL de la vidéo YouTube",
+          "requis": true
+        },
+        "duree_clip": {
+          "type": "integer",
+          "description": "Durée en secondes de chaque clip extrait (défaut 45)"
+        },
+        "sous_titres": {
+          "type": "boolean",
+          "description": "Incruster les titres des chapitres comme sous-titres (défaut true)"
+        },
+        "narration": {
+          "type": "boolean",
+          "description": "Ajouter une narration TTS au montage (défaut false)"
+        },
+        "export_vertical": {
+          "type": "string",
+          "description": "Mode d'export vertical (blur, crop, pad — vide = pas d'export)",
+          "enum": ["blur", "crop", "pad", ""]
+        }
+      },
+      "action": true
+    }
+  ],
+  "taches": []
+}

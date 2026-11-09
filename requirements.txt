@@ -1,13 +1,6 @@
 youtube-transcript-api
 tiktoken
-python-dotenv
-streamlit
-requests
-fpdf2
-openai
-openai-whisper
-yt-dlp>=2026.3.17
-gtts
-google-auth-oauthlib
-google-auth-httplib2
-google-api-python-client
+httpx
+fastapi
+uvicorn
+python-multipart

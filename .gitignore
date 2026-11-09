@@ -1,14 +1,5 @@
-__pycache__/
-*.pyc
-*.pyo
 .env
+__pycache__/
+.superpowers/
+*.pyc
 .DS_Store
-.streamlit/secrets.toml
-.streamlit/youtube_cookies.txt
-dist/
-build/
-*.egg-info/
-.eggs/
-.playwright-mcp/
-pwa/icon-*.png
-.opencode/
