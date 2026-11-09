@@ -48,6 +48,7 @@ TEXTS = {
         "err_image": "Génération d’image impossible.",
         "prov_custom": "Personnalisé",
         "avertissements": "Avertissements",
+"limites_light": "Version en ligne : fonctionne uniquement avec les vidéos qui ont des sous-titres YouTube (manuels ou automatiques) et jusqu'à environ 30 minutes. Pour une vidéo sans sous-titres, utilisez la version locale (transcription Whisper).",
     },
     "en": {
         "tagline": "AI-powered YouTube video summaries",
@@ -96,5 +97,6 @@ TEXTS = {
         "err_image": "Image generation failed.",
         "prov_custom": "Custom",
         "avertissements": "Warnings",
+"limites_light": "Online version: only works with videos that have YouTube captions (manual or auto-generated), up to about 30 minutes. For a video without captions, use the local version (Whisper transcription).",
     },
 }

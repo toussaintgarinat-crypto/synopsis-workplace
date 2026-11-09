@@ -222,9 +222,21 @@ def _max_batch() -> int:
     return int(os.getenv("MAX_BATCH_FULL", "20"))
 
 
+def _transcript_hint() -> str:
+    if is_light_mode():
+        return ("Cette version en ligne lit uniquement les sous-titres YouTube (pas de transcription audio) : "
+                "essayez une vidéo qui en a, ou utilisez la version locale (Whisper).")
+    return "Astuce : envoyez le fichier audio/vidéo pour une transcription Whisper."
+
+
 def _summarize(url: str, output_language: str = "Français", model: str = "", api_key: str = "", provider: str = "") -> dict:
     logger.info("Resumer %s (lang=%s)", url, output_language)
-    data = get_youtube_transcript(url)
+    try:
+        data = get_youtube_transcript(url)
+    except ValueError as e:
+        if "ranscript" in str(e):
+            raise ValueError(f"{str(e).rstrip('.')}. {_transcript_hint()}") from e
+        raise
     return _summarize_data(data, output_language, model, api_key, provider)
 
 
@@ -489,6 +501,7 @@ footer { text-align: center; margin-top: 80px; color: var(--text2); font-size: 0
       <div style="flex:2">
         <label data-t="url_youtube">URL YouTube</label>
         <input type="text" id="url" placeholder="https://www.youtube.com/watch?v=..." autofocus>
+        <div id="limites" data-t="limites_light" style="display:none;margin-top:8px;font-size:0.85rem;color:var(--text2)"></div>
       </div>
       <div style="flex:1">
         <label data-t="langue">Langue</label>
@@ -570,6 +583,7 @@ var FR_SECOURS = {
   question: 'Poser une question', demander: 'Demander', ph_question: 'Une question sur cette vidéo...',
   langue_source: 'Langue source',
   avertissements: 'Avertissements', prov_custom: 'Personnalisé',
+  limites_light: 'Version en ligne : fonctionne uniquement avec les vidéos qui ont des sous-titres YouTube (manuels ou automatiques) et jusqu’à environ 30 minutes. Pour une vidéo sans sous-titres, utilisez la version locale (transcription Whisper).',
   err_url: 'Colle une URL YouTube.', err_cle: 'Saisis ta clé API dans Configuration.', err_urls: 'Colle au moins une URL.',
   fichier_titre: 'Résumer un fichier audio/vidéo', resumer_fichier: 'Transcrire et résumer', err_fichier: 'Choisis un fichier audio ou vidéo.',
   export_obsidian: 'Envoyer vers Obsidian', export_excalidraw: 'Enregistrer en Excalidraw', ph_vault: 'Dossier du vault Obsidian', ok_obsidian: 'Note enregistrée : ', err_vault: 'Indique le dossier du vault.',
@@ -746,6 +760,8 @@ async function chargerCapacites() {
     var r = await fetch('/sante');
     var d = await r.json();
     CAPS = d.capacites || {};
+    var lim = $('#limites');
+    if (lim && d.mode === 'light') lim.style.display = '';
   } catch (e) { CAPS = {}; }
   appliquerCapacites();
 }
