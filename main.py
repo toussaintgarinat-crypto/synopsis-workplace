@@ -235,7 +235,8 @@ def _summarize(url: str, output_language: str = "Français", model: str = "", ap
         data = get_youtube_transcript(url)
     except ValueError as e:
         if "ranscript" in str(e):
-            raise ValueError(f"{str(e).rstrip('.')}. {_transcript_hint()}") from e
+            cause = " ".join(str(e).split())[:140].rstrip(" .:")
+            raise ValueError(f"{_transcript_hint()} (Détail : {cause})") from e
         raise
     return _summarize_data(data, output_language, model, api_key, provider)
 
